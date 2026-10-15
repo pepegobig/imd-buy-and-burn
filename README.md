@@ -23,7 +23,7 @@ A contract on Base that turns USDC into burned IMD. It receives the Lobby (neigh
   0.1% of that reserve loses at most about d x the burn. A sandwich therefore costs its author about three times what the
   burn loses, unless the author has owned more than two thirds of the pool's liquidity since the window began. Fren
   Pet's 4% buy and sell fees make the WETH/Fren Pet leg costlier still. For pools worth under about $10,000 the $5 floor
-  lets a burn reach 0.2% of a reserve, which halves that margin (amounts of cents).
+  lets a burn reach 0.2% of a reserve or more, which shrinks that margin (amounts of cents).
 - **`burnHeld()`** sends any Fren Pet that was sent to the contract directly to `0x…dEaD`.
 - Fren Pet charges a 4% buy fee and enforces size limits, but exempts transfers to `0x…dEaD` from both.
 
@@ -62,6 +62,15 @@ BASE_RPC=https://base-rpc.publicnode.com forge test -vv
 - IMD swarm re-check, job `564c3cc7-2913-425a-8855-d29a04f00878`, commit `218b030`: no high or medium; 2 low, 2 info. The
   size bound now uses the smaller of the reserves now and at the window's start (flash liquidity), a very thin pool
   drains $5 a window instead of reverting, and the $5 floor's effect on the economics is documented.
+- IMD swarm final check, job `c00ee601-a70b-43c9-8bb7-774e16c1c15a`, commit `440edec` (deployed at
+  `0xcad3cecbb402b9a7f5c08e3dbee57a34d2f949fa`): no high or medium; 1 low, 2 info, accepted and documented here. The low:
+  the window-start reserves are stored inside a caller's transaction, so flash liquidity at two moments 30 minutes apart
+  can lift one burn's size bound to $1,000 (about $415 at today's reserves). That only matters while the contract holds
+  more than the honest bound, and a sandwich inside the 3% band would only pay with the USDC/WETH pool's real reserve
+  under about $420k (about $439k today); the loss is at most $30 per 30-minute window. Burning each Lobby payout (about
+  $10) when it arrives keeps the balance far below the bound. The infos: the stored reserves can also be lowered in the
+  storing transaction (a burn then gets smaller for one window), and for pools under about $5,000 the $5 floor is more
+  than 0.2% of a reserve.
 
 ## Audit scope
 
