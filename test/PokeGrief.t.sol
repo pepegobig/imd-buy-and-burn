@@ -57,8 +57,8 @@ contract MockPair {
     }
 }
 
-// The swarm re-audit's proof for its finding 1 (IMD job dca64686): a pump, poke(), unwind bundle must not delay a
-// valid burn. Adapted: poke() now opens a pending window instead of reverting, so the first expectRevert is gone.
+// The swarm re-audit's proof for its finding 1 (IMD job dca64686): a pump, window restart, unwind bundle must not delay a
+// valid burn. Adapted to the bounded window: observe() refuses to restart an open window, so the bundle cannot touch it.
 contract PokeGriefTest is Test {
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address constant WETH = 0x4200000000000000000000000000000000000006;
@@ -92,13 +92,13 @@ contract PokeGriefTest is Test {
         return (inWithFee * rOut) / (rIn * 1000 + inWithFee);
     }
 
-    /// poke() delays a burn that succeeds both before and after the caller's transaction
+    /// A bundle that pumps a pool, tries to restart the window and unwinds must not delay a valid burn
     function test_PumpPokeUnwindDelaysAValidBurn() public {
         _deploy(165.6e18, 66_004e18); // pair B at its Base reserves
         MockToken(USDC).mint(address(burner), 100e6);
-        vm.warp(block.timestamp + 6 hours + 1);
+        vm.warp(block.timestamp + 31 minutes);
 
-        // One transaction (flash-swap sized): buy WETH from pair A to make it ~3.2% dearer, poke(), sell the WETH back
+        // One transaction (flash-swap sized): buy WETH from pair A to make it ~3.2% dearer, observe(), sell the WETH back
         address attacker = makeAddr("attacker");
         uint256 usdcIn = 7_000e6;
         MockToken(USDC).mint(attacker, usdcIn);
@@ -107,14 +107,14 @@ contract PokeGriefTest is Test {
         uint256 wethOut = _out(usdcIn, u, w);
         MockToken(USDC).transfer(PAIR_A, usdcIn);
         MockPair(PAIR_A).swap(wethOut, 0, attacker, "");
-        (bool poked,) = address(burner).call(abi.encodeCall(IMDBuyAndBurn.poke, ()));
+        (bool poked,) = address(burner).call(abi.encodeCall(IMDBuyAndBurn.observe, ()));
         (w, u,) = MockPair(PAIR_A).getReserves();
         uint256 usdcBack = _out(wethOut, w, u);
         MockToken(WETH).transfer(PAIR_A, wethOut);
         MockPair(PAIR_A).swap(0, usdcBack, attacker, "");
         vm.stopPrank();
         emit log_named_decimal_uint("attacker cost (USDC)", usdcIn - usdcBack, 6);
-        emit log_named_string("poke inside the bundle", poked ? "succeeded" : "reverted");
+        emit log_named_string("observe inside the bundle", poked ? "succeeded" : "reverted");
 
         // The pools are back where they were, so the burn that was available must still run
         burner.buyAndBurn();

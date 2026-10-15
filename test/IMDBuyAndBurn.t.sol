@@ -94,47 +94,63 @@ contract IMDBuyAndBurnTest is Test {
         burner.buyAndBurn();
     }
 
-    function test_PokeOnlyWhenStale() public {
-        vm.expectRevert(abi.encodeWithSelector(IMDBuyAndBurn.NotStale.selector, uint32(0)));
-        burner.poke();
-        uint32 obs = burner.obsTime();
-        _wait(6 hours + 1);
-        burner.poke();
-        assertEq(burner.pendTime(), uint32(block.timestamp), "pending window opened");
-        assertEq(burner.obsTime(), obs, "the burn window is unchanged");
-        vm.expectRevert(abi.encodeWithSelector(IMDBuyAndBurn.PendingWindow.selector, uint32(0)));
-        burner.poke();
+    function test_ObserveOnlyWhenTheWindowIsTooOld() public {
+        vm.expectRevert(abi.encodeWithSelector(IMDBuyAndBurn.WindowOpen.selector, uint32(0)));
+        burner.observe();
+        _wait(2 hours + 1);
+        burner.observe();
+        assertEq(burner.obsTime(), uint32(block.timestamp));
     }
 
-    /// Audit de9e10c6 finding 4 and dca64686 finding 1: poke() must not delay a burn that would succeed
-    function test_PokeCannotDelayAValidBurn() public {
+    /// Audit de9e10c6 finding 4, dca64686 finding 1, b2cad286 finding 4: restarting the window cannot delay a burn
+    function test_ObserveCannotDelayAValidBurn() public {
         _fund(10e6);
-        _wait(6 hours + 1);
-        burner.poke();
+        _wait(31 minutes);
+        vm.expectRevert(abi.encodeWithSelector(IMDBuyAndBurn.WindowOpen.selector, uint32(31 minutes)));
+        burner.observe();
         assertGt(burner.buyAndBurn(), 0);
-        assertEq(burner.pendTime(), 0, "a burn closes the pending window");
     }
 
-    /// After a real price move, a burn waits; poke() then starts a window at the new price
-    function test_PokeRestartsTheWindowAfterAPriceMove() public {
+    /// Audit b2cad286 finding 1: a window never gets older than MAX_WINDOW
+    function test_OldWindowNeedsObserve() public {
         _fund(10e6);
-        _wait(6 hours + 1);
+        _wait(2 hours + 1);
+        vm.expectRevert(abi.encodeWithSelector(IMDBuyAndBurn.WindowTooOld.selector, uint32(2 hours + 1)));
+        burner.buyAndBurn();
+        burner.observe();
+        _wait(31 minutes);
+        assertGt(burner.buyAndBurn(), 0);
+    }
+
+    /// After a real price rise, a burn waits for a window at the new price
+    function test_PriceRiseWaitsForANewWindow() public {
+        _fund(10e6);
+        _wait(31 minutes);
         _pumpImd(8); // IMD about 25% dearer, and it stays there
         vm.expectRevert();
         burner.buyAndBurn(); // PriceOffTwap
-        burner.poke();
+        _wait(2 hours);
+        burner.observe();
         _wait(31 minutes);
         assertGt(burner.buyAndBurn(), 0);
     }
 
-    /// Audit de9e10c6 finding 6 and dca64686 finding 2: a capped burn leaves a burnable remainder, never dust
-    function test_CappedBurnLeavesABurnableRemainder() public {
+    /// A cheaper IMD than the TWAP passes: buying below the average helps the burn
+    function test_PriceDropStillBurns() public {
+        _fund(10e6);
+        _wait(31 minutes);
+        IUniswapV2Pair pair = burner.WETH_IMD();
+        deal(FP, address(pair), IERC20(FP).balanceOf(address(pair)) * 3 / 2); // IMD about a third cheaper
+        (bool ok,) = address(pair).call(abi.encodeWithSignature("sync()"));
+        assertTrue(ok);
+        assertGt(burner.buyAndBurn(), 0);
+    }
+
+    /// Audit de9e10c6 finding 6, dca64686 finding 2, b2cad286 finding 5: a capped burn never leaves dust behind
+    function test_CappedBurnSpendsTheDust() public {
         _wait(31 minutes);
         (uint256 cap,,,,) = _previewFor(10_000e6);
         _fund(cap + 4e6);
-        burner.buyAndBurn();
-        assertEq(IERC20(USDC).balanceOf(address(burner)), 5e6, "exactly THRESHOLD is left");
-        _wait(31 minutes);
         burner.buyAndBurn();
         assertEq(IERC20(USDC).balanceOf(address(burner)), 0);
     }
@@ -148,15 +164,13 @@ contract IMDBuyAndBurnTest is Test {
         return (a, b, c, d, e);
     }
 
-    /// Audit finding 3: if FP's owner removes 0xdead's fee exemption, burns still run and the event shows the loss
+    /// Audit de9e10c6 finding 3: if FP's owner removes 0xdead's fee exemption, burns still run and the event shows the loss
     function test_FeeExemptionRemovedStillBurns() public {
         _fund(100e6);
         _wait(31 minutes);
-        (bool ok,) = FP.call(abi.encodeWithSignature("owner()"));
-        assertTrue(ok);
         address fpOwner = abi.decode(_call(FP, abi.encodeWithSignature("owner()")), (address));
         vm.prank(fpOwner);
-        (ok,) = FP.call(abi.encodeWithSignature("excludeFromFees(address,bool)", DEAD, false));
+        (bool ok,) = FP.call(abi.encodeWithSignature("excludeFromFees(address,bool)", DEAD, false));
         assertTrue(ok, "excludeFromFees");
         (,,, uint256 poolOut,) = burner.preview();
         uint256 burned = burner.buyAndBurn();
@@ -190,6 +204,8 @@ contract IMDBuyAndBurnTest is Test {
     function test_BurnsAfterLongIdle() public {
         _fund(10e6);
         _wait(3 days);
+        burner.observe();
+        _wait(31 minutes);
         assertGt(burner.buyAndBurn(), 0);
     }
 

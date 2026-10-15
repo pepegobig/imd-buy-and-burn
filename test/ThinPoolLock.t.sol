@@ -105,10 +105,10 @@ contract ThinPoolLockTest is Test {
     /// The thin pool drains over several windows instead of locking
     function test_ThinPoolDrainsOverSeveralBurns() public {
         MockToken(USDC).mint(address(burner), 1_000e6);
-        for (uint256 i = 0; i < 10 && MockToken(USDC).balanceOf(address(burner)) >= 5e6; i++) {
+        for (uint256 i = 0; i < 40 && MockToken(USDC).balanceOf(address(burner)) >= 5e6; i++) {
             vm.warp(block.timestamp + 31 minutes);
             burner.buyAndBurn();
         }
-        assertLt(MockToken(USDC).balanceOf(address(burner)), 5e6, "all but dust burned");
+        assertEq(MockToken(USDC).balanceOf(address(burner)), 0, "all burned, no dust");
     }
 }
