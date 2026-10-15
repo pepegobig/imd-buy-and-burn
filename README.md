@@ -7,8 +7,10 @@ A contract on Base that turns USDC into burned IMD. It receives the Lobby (neigh
   (`0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7`) is a LayerZero OFT whose Base peer is an adapter that locks Fren Pet.
 - **No owner, no withdraw.** USDC can only leave through `buyAndBurn()`. The contract does not accept ETH.
 - **`buyAndBurn()`**, callable by anyone when the contract holds at least $5 of USDC and the price window is between 30
-  minutes and 2 hours old: spends up to $1,000 and at most 0.1% of either pool's reserves (a thin pool burns in smaller
-  steps instead of locking; a remainder under $5 is spent with the last capped burn rather than stranded), swaps
+  minutes and 2 hours old: spends up to $1,000 and at most 0.1% of either pool's reserves, measured as the smaller of the
+  reserves now and at the window's start (liquidity added inside the burn's transaction cannot raise the bound). A burn
+  is never smaller than $5, so even a very thin pool drains $5 a window instead of locking, and a remainder under $5 is
+  spent with the last capped burn rather than stranded. It swaps
   USDC -> WETH -> Fren Pet through the Uniswap v2 pairs `0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C` (USDC/WETH) and
   `0xDE66c35e01ED8e619Bf092352338ef94f2327337` (WETH/Fren Pet), and has the second pair send the tokens straight to
   `0x000000000000000000000000000000000000dEaD`.
@@ -19,8 +21,9 @@ A contract on Base that turns USDC into burned IMD. It receives the Lobby (neigh
   `observe()`, waits 30 minutes, then calls `buyAndBurn()`.
 - **Economics.** Moving a pool's price by d costs about 0.3% x d x its reserve in round-trip fees, while a burn of at most
   0.1% of that reserve loses at most about d x the burn. A sandwich therefore costs its author about three times what the
-  burn loses, unless the author owns more than two thirds of the pool's liquidity. Fren Pet's 4% buy and sell fees make
-  the WETH/Fren Pet leg costlier still.
+  burn loses, unless the author has owned more than two thirds of the pool's liquidity since the window began. Fren
+  Pet's 4% buy and sell fees make the WETH/Fren Pet leg costlier still. For pools worth under about $10,000 the $5 floor
+  lets a burn reach 0.2% of a reserve, which halves that margin (amounts of cents).
 - **`burnHeld()`** sends any Fren Pet that was sent to the contract directly to `0x…dEaD`.
 - Fren Pet charges a 4% buy fee and enforces size limits, but exempts transfers to `0x…dEaD` from both.
 
@@ -56,6 +59,9 @@ BASE_RPC=https://base-rpc.publicnode.com forge test -vv
   burn window with no maximum age) and the pending-window lows are removed by the bounded window in this commit; the
   size bound is now 0.1%. Commit `e70a156` was deployed at `0xcf943c7787e1f4503594e04fbd3b969157f34120` before this check
   and is retired: do not send it funds.
+- IMD swarm re-check, job `564c3cc7-2913-425a-8855-d29a04f00878`, commit `218b030`: no high or medium; 2 low, 2 info. The
+  size bound now uses the smaller of the reserves now and at the window's start (flash liquidity), a very thin pool
+  drains $5 a window instead of reverting, and the $5 floor's effect on the economics is documented.
 
 ## Audit scope
 

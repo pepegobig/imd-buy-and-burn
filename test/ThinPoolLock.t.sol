@@ -112,3 +112,43 @@ contract ThinPoolLockTest is Test {
         assertEq(MockToken(USDC).balanceOf(address(burner)), 0, "all burned, no dust");
     }
 }
+
+/// Audit 564c3cc7 finding 2: a pool too thin for a $5 burn at 0.1% still drains $5 a window instead of locking
+contract VeryThinPoolTest is Test {
+    address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
+    address constant WETH = 0x4200000000000000000000000000000000000006;
+    address constant IMD = 0xFF0C532FDB8Cd566Ae169C1CB157ff2Bdc83E105;
+    address constant PAIR_A = 0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C;
+    address constant PAIR_B = 0xDE66c35e01ED8e619Bf092352338ef94f2327337;
+
+    IMDBuyAndBurn burner;
+
+    function setUp() public {
+        vm.warp(1_760_000_000);
+        address tok = address(new MockToken());
+        vm.etch(USDC, tok.code);
+        vm.etch(WETH, tok.code);
+        vm.etch(IMD, tok.code);
+        address pair = address(new MockPair());
+        vm.etch(PAIR_A, pair.code);
+        vm.etch(PAIR_B, pair.code);
+        MockToken(WETH).mint(PAIR_A, 180e18);
+        MockToken(USDC).mint(PAIR_A, 437_000e6);
+        MockPair(PAIR_A).init(WETH, USDC);
+        MockToken(WETH).mint(PAIR_B, 2e18); // the WETH side is worth about $4,855: 0.1% is under $5
+        MockToken(IMD).mint(PAIR_B, 760e18);
+        MockPair(PAIR_B).init(WETH, IMD);
+        burner = new IMDBuyAndBurn();
+    }
+
+    function test_VeryThinPoolStillDrains() public {
+        MockToken(USDC).mint(address(burner), 20e6);
+        for (uint256 i = 0; i < 8 && MockToken(USDC).balanceOf(address(burner)) > 0; i++) {
+            vm.warp(block.timestamp + 31 minutes);
+            (uint256 usdcIn,,,,) = burner.preview();
+            assertGe(usdcIn, 5e6, "never smaller than THRESHOLD");
+            burner.buyAndBurn();
+        }
+        assertEq(MockToken(USDC).balanceOf(address(burner)), 0, "nothing stuck");
+    }
+}

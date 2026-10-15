@@ -155,6 +155,20 @@ contract IMDBuyAndBurnTest is Test {
         assertEq(IERC20(USDC).balanceOf(address(burner)), 0);
     }
 
+    /// Audit 564c3cc7 finding 1: liquidity added in the burn's own transaction cannot raise the size bound
+    function test_FlashLiquidityDoesNotRaiseTheCap() public {
+        _fund(1_000e6);
+        _wait(31 minutes);
+        (uint256 capBefore,,,,) = burner.preview();
+        IUniswapV2Pair pair = burner.USDC_WETH();
+        deal(USDC, address(pair), IERC20(USDC).balanceOf(address(pair)) * 10);
+        deal(WETH, address(pair), IERC20(WETH).balanceOf(address(pair)) * 10);
+        (bool ok,) = address(pair).call(abi.encodeWithSignature("sync()"));
+        assertTrue(ok);
+        (uint256 capAfter,,,,) = burner.preview();
+        assertLe(capAfter, capBefore, "the bound uses the reserves at the window's start");
+    }
+
     /// preview() for a balance, without keeping that balance
     function _previewFor(uint256 amount) internal returns (uint256, uint256, uint256, uint256, uint32) {
         uint256 snap = vm.snapshotState();

@@ -24,12 +24,16 @@ interface IUniswapV2Pair {
 /// impact) with its time-weighted average (TWAP) over the current window, which must be between MIN_WINDOW and
 /// MAX_WINDOW old. If IMD is more than MAX_DEVIATION_BPS dearer than the TWAP (for example, moved by an atomic
 /// sandwich), the burn reverts. A cheaper IMD passes: buying below the average is good for the burn. Fees and the trade's
-/// own impact are not part of this check: they are bounded by size, since one burn spends at most DEPTH_BPS of either
-/// pair's reserves and at most MAX_PER_BURN (plus a remainder under THRESHOLD, which is never left behind).
+/// own impact are not part of this check: they are bounded by size. One burn spends at most DEPTH_BPS of either pair's
+/// input-side reserve, measured as the smaller of the reserve now and at the start of the window (so liquidity added
+/// inside the burn's transaction cannot raise it), and at most MAX_PER_BURN. Two exceptions keep USDC from getting
+/// stuck: a burn is never smaller than THRESHOLD, so a very thin pool still drains $5 a window, and a remainder under
+/// THRESHOLD is spent with the last capped burn.
 /// @dev Economics. Moving a v2 pair's price by d costs about 0.3% * d * reserve in round-trip fees; a burn of size S
 /// loses at most about d * S to it. With S <= DEPTH_BPS = 0.1% of the reserve, a sandwich costs its author about three
-/// times what the burn loses, unless the author owns more than two thirds of the pair's liquidity (and gets the fees
-/// back). On the WETH/FP pair FP's own 4% buy and sell fees make it costlier still.
+/// times what the burn loses, unless the author has owned more than two thirds of the pair's liquidity since the window
+/// began (and gets the fees back). On the WETH/FP pair FP's own 4% buy and sell fees make it costlier still. Near the
+/// THRESHOLD floor (pools worth under about $10,000) a burn can reach 0.2% of a reserve, which halves that margin.
 /// @dev Windows. The window starts at the last burn, at deployment, or at observe(). observe() restarts it only when it
 /// is older than MAX_WINDOW, when no burn can run anyway, so it can never delay a burn.
 /// @dev Trust assumptions outside this contract (accepted, see README): Fren Pet's owner can blacklist 0x...dEaD, the
@@ -60,6 +64,10 @@ contract IMDBuyAndBurn {
     uint256 public obsUsdcWeth;
     uint256 public obsWethImd;
     uint32 public obsTime;
+    /// @notice Reserves at the start of the current window (USDC and WETH of the USDC/WETH pair, WETH of the WETH/FP pair)
+    uint112 public obsUsdc;
+    uint112 public obsWethA;
+    uint112 public obsWethB;
 
     uint256 public totalUsdcSpent;
     uint256 public totalImdBurned;
@@ -72,7 +80,6 @@ contract IMDBuyAndBurn {
     error WindowTooShort(uint32 elapsed);
     error WindowTooOld(uint32 elapsed);
     error WindowOpen(uint32 elapsed);
-    error PoolTooThin(uint256 cap);
     error PriceOffTwap(uint256 twapOut, uint256 spotOut);
     error BadPair();
 
@@ -83,7 +90,7 @@ contract IMDBuyAndBurn {
         uint256 spotOut; // IMD for usdcIn at the current reserves, marginal
         uint256 cumA;
         uint256 cumB;
-        uint256 cap; // the size bound: min(MAX_PER_BURN, DEPTH_BPS of either pair's input-side reserve)
+        uint256 cap; // the size bound: min(MAX_PER_BURN, DEPTH_BPS of either pair's input-side reserve, now and at obsTime)
         uint32 elapsed;
     }
 
@@ -107,7 +114,6 @@ contract IMDBuyAndBurn {
         Quote memory q = _quote(balance);
         if (q.elapsed < MIN_WINDOW) revert WindowTooShort(q.elapsed);
         if (q.elapsed > MAX_WINDOW) revert WindowTooOld(q.elapsed);
-        if (q.cap < THRESHOLD) revert PoolTooThin(q.cap);
         if (!_withinTolerance(q)) revert PriceOffTwap(q.twapOut, q.spotOut);
 
         // Hop 1: USDC -> WETH, delivered straight to the second pair
@@ -124,9 +130,7 @@ contract IMDBuyAndBurn {
         else WETH_IMD.swap(imdOut, 0, DEAD, "");
         burned = IMD.balanceOf(DEAD) - deadBefore;
 
-        obsUsdcWeth = q.cumA;
-        obsWethImd = q.cumB;
-        obsTime = uint32(block.timestamp);
+        _observe();
         totalUsdcSpent += q.usdcIn;
         totalImdBurned += burned;
         emit Burned(msg.sender, q.usdcIn, wethOut, imdOut, burned);
@@ -180,16 +184,17 @@ contract IMDBuyAndBurn {
         (uint256 rUsdc, uint256 rWethA) = _reserves(USDC_WETH, usdcIsToken0);
         (uint256 rWethB, uint256 rImd) = _reserves(WETH_IMD, wethIsToken0);
 
-        // Size: at most MAX_PER_BURN and DEPTH_BPS of the USDC reserve and of the WETH reserve (valued in USDC)
+        // Size: at most MAX_PER_BURN and DEPTH_BPS of the USDC reserve and of the WETH reserve (valued in USDC), each
+        // taken as the smaller of now and the window's start
         uint256 cap = MAX_PER_BURN;
-        uint256 depthA = (rUsdc * DEPTH_BPS) / 10_000;
-        uint256 depthB = rWethA == 0 ? 0 : (((rWethB * DEPTH_BPS) / 10_000) * rUsdc) / rWethA;
-        uint256 depth = depthA < depthB ? depthA : depthB;
+        uint256 depth = _depth(rUsdc, rWethA, rWethB);
+        uint256 depthThen = _depth(obsUsdc, obsWethA, obsWethB);
+        if (depthThen < depth) depth = depthThen;
         if (depth < cap) cap = depth;
         q.cap = cap;
-        // A capped burn would leave dust under THRESHOLD that no later burn could take: spend it too (at most
-        // THRESHOLD - 1 over the cap)
-        q.usdcIn = balance < cap + THRESHOLD ? balance : cap;
+        // Never smaller than THRESHOLD (a very thin pool still drains), and never leave a remainder under THRESHOLD
+        uint256 size = cap > THRESHOLD ? cap : THRESHOLD;
+        q.usdcIn = balance < size + THRESHOLD ? balance : size;
 
         q.cumA = _cumulative(USDC_WETH, usdcIsToken0);
         q.cumB = _cumulative(WETH_IMD, wethIsToken0);
@@ -209,7 +214,19 @@ contract IMDBuyAndBurn {
         obsUsdcWeth = _cumulative(USDC_WETH, usdcIsToken0);
         obsWethImd = _cumulative(WETH_IMD, wethIsToken0);
         obsTime = uint32(block.timestamp);
+        (uint256 rUsdc, uint256 rWethA) = _reserves(USDC_WETH, usdcIsToken0);
+        (uint256 rWethB,) = _reserves(WETH_IMD, wethIsToken0);
+        obsUsdc = uint112(rUsdc);
+        obsWethA = uint112(rWethA);
+        obsWethB = uint112(rWethB);
         emit Observed(obsTime);
+    }
+
+    /// @dev DEPTH_BPS of the USDC reserve and of the WETH/FP pair's WETH reserve valued in USDC, the smaller one
+    function _depth(uint256 rUsdc, uint256 rWethA, uint256 rWethB) private pure returns (uint256) {
+        uint256 depthA = (rUsdc * DEPTH_BPS) / 10_000;
+        uint256 depthB = rWethA == 0 ? 0 : (((rWethB * DEPTH_BPS) / 10_000) * rUsdc) / rWethA;
+        return depthA < depthB ? depthA : depthB;
     }
 
     /// @dev (input-token reserve, output-token reserve) of a hop
