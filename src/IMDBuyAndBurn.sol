@@ -20,9 +20,15 @@ interface IUniswapV2Pair {
 /// IMD on Base is Fren Pet (FP): the Ethereum IMD token is a LayerZero OFT whose Base peer locks FP.
 /// Route: USDC -> WETH -> FP through two Uniswap v2 pairs; the second pair sends the FP straight to 0x...dEaD.
 /// There is no owner and no withdraw function: USDC can only leave through buyAndBurn().
-/// @dev Price safety: each burn checks the pools' current output against their time-weighted average price (TWAP)
-/// since the previous burn (at least MIN_WINDOW ago). A pool moved inside the burn transaction (an atomic sandwich)
-/// makes the output fall short of the TWAP and the burn reverts.
+/// @dev Price safety. Before it trades, a burn compares the route's marginal price (both pairs' reserves, no fees, no
+/// impact) with its time-weighted average (TWAP) since the last observation, at least MIN_WINDOW earlier. If IMD is more
+/// than MAX_DEVIATION_BPS dearer than the TWAP (for example, moved by an atomic sandwich), the burn reverts. Fees and the
+/// trade's own impact are not part of this check: they are bounded by size instead, since one burn spends at most
+/// DEPTH_BPS of either pair's reserves (and at most MAX_PER_BURN).
+/// @dev Trust assumptions outside this contract (accepted, see README): Fren Pet's owner can blacklist 0x...dEaD, the
+/// WETH/FP pair or this contract, which stops all burns and leaves the USDC here for good; the owner can also remove
+/// 0x...dEaD's fee exemption, after which up to FP's buy fee (4% today) of each purchase goes to the FP contract instead
+/// of 0x...dEaD (the Burned event reports it). Circle can blacklist this contract on USDC with the same effect.
 contract IMDBuyAndBurn {
     IERC20 public constant USDC = IERC20(0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913);
     address public constant WETH = 0x4200000000000000000000000000000000000006;
@@ -32,8 +38,9 @@ contract IMDBuyAndBurn {
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     uint256 public constant THRESHOLD = 5e6; // $5 of USDC (6 decimals)
-    uint256 public constant MAX_PER_BURN = 1_000e6; // larger balances burn in several calls (keeps price impact under 1%)
-    uint256 public constant MAX_SHORTFALL_BPS = 300; // output may be at most 3% below the TWAP (covers 2 x 0.3% fees)
+    uint256 public constant MAX_PER_BURN = 1_000e6; // larger balances burn in several calls
+    uint256 public constant DEPTH_BPS = 50; // one burn spends at most 0.5% of either pair's input-side reserve
+    uint256 public constant MAX_DEVIATION_BPS = 300; // the route's marginal price may be at most 3% worse than the TWAP
     uint32 public constant MIN_WINDOW = 30 minutes;
     uint32 public constant STALE_AFTER = 6 hours;
 
@@ -49,14 +56,26 @@ contract IMDBuyAndBurn {
     uint256 public totalUsdcSpent;
     uint256 public totalImdBurned;
 
-    event Burned(address indexed caller, uint256 usdcIn, uint256 wethOut, uint256 imdBurned);
+    /// @param imdBought what the pair sent; imdBurned what reached 0x...dEaD (lower only if FP charged its buy fee)
+    event Burned(address indexed caller, uint256 usdcIn, uint256 wethOut, uint256 imdBought, uint256 imdBurned);
     event Observed(uint32 time);
 
     error BelowThreshold(uint256 balance);
     error WindowTooShort(uint32 elapsed);
     error NotStale(uint32 elapsed);
-    error PriceOffTwap(uint256 expected, uint256 actual);
+    error BurnAvailable();
+    error PriceOffTwap(uint256 twapOut, uint256 spotOut);
     error BadPair();
+
+    /// @dev A burn as it would run in this block
+    struct Quote {
+        uint256 usdcIn;
+        uint256 twapOut; // IMD for usdcIn at the TWAP, marginal (no fees, no impact)
+        uint256 spotOut; // IMD for usdcIn at the current reserves, marginal
+        uint256 cumA;
+        uint256 cumB;
+        uint32 elapsed;
+    }
 
     constructor() {
         address u0 = USDC_WETH.token0();
@@ -70,60 +89,44 @@ contract IMDBuyAndBurn {
         _observe();
     }
 
-    /// @notice Spends the contract's USDC (up to MAX_PER_BURN) on IMD and burns it. Anyone may call it once the
-    /// balance is at least THRESHOLD and MIN_WINDOW has passed since the last observation.
+    /// @notice Spends the contract's USDC (bounded by MAX_PER_BURN and the pools' depth) on IMD and burns it. Anyone may
+    /// call it once the balance is at least THRESHOLD and MIN_WINDOW has passed since the last observation.
     function buyAndBurn() external returns (uint256 burned) {
         uint256 balance = USDC.balanceOf(address(this));
         if (balance < THRESHOLD) revert BelowThreshold(balance);
-        uint32 elapsed;
-        unchecked {
-            elapsed = uint32(block.timestamp) - obsTime;
-        }
-        if (elapsed < MIN_WINDOW) revert WindowTooShort(elapsed);
-
-        uint256 usdcIn = balance > MAX_PER_BURN ? MAX_PER_BURN : balance;
-
-        // Expected output at the TWAP since the last observation
-        uint256 cumA = _cumulative(USDC_WETH, usdcIsToken0);
-        uint256 cumB = _cumulative(WETH_IMD, wethIsToken0);
-        uint256 avgA;
-        uint256 avgB;
-        unchecked {
-            avgA = (cumA - obsUsdcWeth) / elapsed;
-            avgB = (cumB - obsWethImd) / elapsed;
-        }
-        uint256 expectedImd = _mulQ112(_mulQ112(usdcIn, avgA), avgB);
+        Quote memory q = _quote(balance);
+        if (q.elapsed < MIN_WINDOW) revert WindowTooShort(q.elapsed);
+        if (q.spotOut < (q.twapOut * (10_000 - MAX_DEVIATION_BPS)) / 10_000) revert PriceOffTwap(q.twapOut, q.spotOut);
 
         // Hop 1: USDC -> WETH, delivered straight to the second pair
-        uint256 wethOut = _amountOut(USDC_WETH, usdcIsToken0, usdcIn);
-        require(USDC.transfer(address(USDC_WETH), usdcIn), "USDC transfer");
+        uint256 wethOut = _amountOut(USDC_WETH, usdcIsToken0, q.usdcIn);
+        require(USDC.transfer(address(USDC_WETH), q.usdcIn), "USDC transfer");
         if (usdcIsToken0) USDC_WETH.swap(0, wethOut, address(WETH_IMD), "");
         else USDC_WETH.swap(wethOut, 0, address(WETH_IMD), "");
 
-        // Hop 2: WETH -> IMD, delivered straight to 0x...dEaD (FP exempts transfers to it from its size limits)
+        // Hop 2: WETH -> IMD, delivered straight to 0x...dEaD (FP exempts transfers to it from its size limits and,
+        // today, from its buy fee)
         uint256 imdOut = _amountOut(WETH_IMD, wethIsToken0, wethOut);
-        if (imdOut < (expectedImd * (10_000 - MAX_SHORTFALL_BPS)) / 10_000) revert PriceOffTwap(expectedImd, imdOut);
         uint256 deadBefore = IMD.balanceOf(DEAD);
         if (wethIsToken0) WETH_IMD.swap(0, imdOut, DEAD, "");
         else WETH_IMD.swap(imdOut, 0, DEAD, "");
-        burned = IMD.balanceOf(DEAD) - deadBefore; // FP takes a buy fee, so this can be below imdOut
+        burned = IMD.balanceOf(DEAD) - deadBefore;
 
-        obsUsdcWeth = cumA;
-        obsWethImd = cumB;
+        obsUsdcWeth = q.cumA;
+        obsWethImd = q.cumB;
         obsTime = uint32(block.timestamp);
-        totalUsdcSpent += usdcIn;
+        totalUsdcSpent += q.usdcIn;
         totalImdBurned += burned;
-        emit Burned(msg.sender, usdcIn, wethOut, burned);
+        emit Burned(msg.sender, q.usdcIn, wethOut, imdOut, burned);
     }
 
-    /// @notice Starts a fresh TWAP window when the last observation is older than STALE_AFTER, so a long price trend
-    /// cannot block burns. It cannot be used to hold burns back: a fresh window can only start after a stale one.
+    /// @notice Starts a fresh TWAP window when the last observation is older than STALE_AFTER and no burn can run now,
+    /// so a long price trend cannot block burns. It reverts while a burn would succeed, so it cannot delay one.
     function poke() external {
-        uint32 elapsed;
-        unchecked {
-            elapsed = uint32(block.timestamp) - obsTime;
-        }
-        if (elapsed <= STALE_AFTER) revert NotStale(elapsed);
+        uint256 balance = USDC.balanceOf(address(this));
+        Quote memory q = _quote(balance);
+        if (q.elapsed <= STALE_AFTER) revert NotStale(q.elapsed);
+        if (balance >= THRESHOLD && q.spotOut >= (q.twapOut * (10_000 - MAX_DEVIATION_BPS)) / 10_000) revert BurnAvailable();
         _observe();
     }
 
@@ -133,27 +136,54 @@ contract IMDBuyAndBurn {
         if (amount > 0) {
             require(IMD.transfer(DEAD, amount), "IMD transfer");
             totalImdBurned += amount;
-            emit Burned(msg.sender, 0, 0, amount);
+            emit Burned(msg.sender, 0, 0, amount, amount);
         }
     }
 
-    /// @notice What a burn would spend now and the IMD it expects at the TWAP (zero inside the first MIN_WINDOW)
-    function preview() external view returns (uint256 usdcIn, uint256 expectedImd, uint256 spotImd, uint32 elapsed) {
-        uint256 balance = USDC.balanceOf(address(this));
-        usdcIn = balance > MAX_PER_BURN ? MAX_PER_BURN : balance;
+    /// @notice What a burn would do now: the USDC it spends, the IMD it would get at the TWAP and at the current reserves
+    /// (both marginal, before fees and impact), the IMD the pools would actually send, and the window length.
+    function preview()
+        external
+        view
+        returns (uint256 usdcIn, uint256 twapOut, uint256 spotOut, uint256 poolOut, uint32 elapsed)
+    {
+        Quote memory q = _quote(USDC.balanceOf(address(this)));
+        usdcIn = q.usdcIn;
+        twapOut = q.twapOut;
+        spotOut = q.spotOut;
+        elapsed = q.elapsed;
+        if (usdcIn > 0) poolOut = _amountOut(WETH_IMD, wethIsToken0, _amountOut(USDC_WETH, usdcIsToken0, usdcIn));
+    }
+
+    function _quote(uint256 balance) private view returns (Quote memory q) {
         unchecked {
-            elapsed = uint32(block.timestamp) - obsTime;
+            q.elapsed = uint32(block.timestamp) - obsTime;
         }
-        if (elapsed > 0) {
+        (uint256 rUsdc, uint256 rWethA) = _reserves(USDC_WETH, usdcIsToken0);
+        (uint256 rWethB, uint256 rImd) = _reserves(WETH_IMD, wethIsToken0);
+
+        // Size: at most MAX_PER_BURN and DEPTH_BPS of the USDC reserve and of the WETH reserve (valued in USDC)
+        uint256 cap = MAX_PER_BURN;
+        uint256 depthA = (rUsdc * DEPTH_BPS) / 10_000;
+        uint256 depthB = rWethA == 0 ? 0 : (((rWethB * DEPTH_BPS) / 10_000) * rUsdc) / rWethA;
+        uint256 depth = depthA < depthB ? depthA : depthB;
+        if (depth < cap) cap = depth;
+        q.usdcIn = balance <= cap ? balance : cap;
+        // A remainder below THRESHOLD would be stranded: spend it too while the pools are deep enough
+        if (q.usdcIn < balance && balance - q.usdcIn < THRESHOLD && balance <= depth) q.usdcIn = balance;
+
+        q.cumA = _cumulative(USDC_WETH, usdcIsToken0);
+        q.cumB = _cumulative(WETH_IMD, wethIsToken0);
+        if (q.elapsed > 0) {
             uint256 avgA;
             uint256 avgB;
             unchecked {
-                avgA = (_cumulative(USDC_WETH, usdcIsToken0) - obsUsdcWeth) / elapsed;
-                avgB = (_cumulative(WETH_IMD, wethIsToken0) - obsWethImd) / elapsed;
+                avgA = (q.cumA - obsUsdcWeth) / q.elapsed;
+                avgB = (q.cumB - obsWethImd) / q.elapsed;
             }
-            expectedImd = _mulQ112(_mulQ112(usdcIn, avgA), avgB);
+            q.twapOut = _mulQ112(_mulQ112(q.usdcIn, avgA), avgB);
         }
-        if (usdcIn > 0) spotImd = _amountOut(WETH_IMD, wethIsToken0, _amountOut(USDC_WETH, usdcIsToken0, usdcIn));
+        if (rUsdc != 0 && rWethB != 0) q.spotOut = (((q.usdcIn * rWethA) / rUsdc) * rImd) / rWethB;
     }
 
     function _observe() private {
@@ -161,6 +191,12 @@ contract IMDBuyAndBurn {
         obsWethImd = _cumulative(WETH_IMD, wethIsToken0);
         obsTime = uint32(block.timestamp);
         emit Observed(obsTime);
+    }
+
+    /// @dev (input-token reserve, output-token reserve) of a hop
+    function _reserves(IUniswapV2Pair pair, bool inIsToken0) private view returns (uint256 rIn, uint256 rOut) {
+        (uint112 r0, uint112 r1,) = pair.getReserves();
+        (rIn, rOut) = inIsToken0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
     }
 
     /// @dev The pair's cumulative price of the input token in output-token units, brought up to this block
@@ -179,8 +215,7 @@ contract IMDBuyAndBurn {
 
     /// @dev Uniswap v2 getAmountOut with the 0.3% fee
     function _amountOut(IUniswapV2Pair pair, bool inIsToken0, uint256 amountIn) private view returns (uint256) {
-        (uint112 r0, uint112 r1,) = pair.getReserves();
-        (uint256 rIn, uint256 rOut) = inIsToken0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+        (uint256 rIn, uint256 rOut) = _reserves(pair, inIsToken0);
         uint256 inWithFee = amountIn * 997;
         return (inWithFee * rOut) / (rIn * 1000 + inWithFee);
     }

@@ -7,15 +7,27 @@ A contract on Base that turns USDC into burned IMD. It receives the Lobby (neigh
   (`0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7`) is a LayerZero OFT whose Base peer is an adapter that locks Fren Pet.
 - **No owner, no withdraw.** USDC can only leave through `buyAndBurn()`. The contract does not accept ETH.
 - **`buyAndBurn()`**, callable by anyone when the contract holds at least $5 of USDC: spends up to $1,000 per call,
-  swaps USDC -> WETH -> Fren Pet through the Uniswap v2 pairs `0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C`
+  and at most 0.5% of either pool's reserves (a thin pool burns in smaller steps instead of locking), swaps USDC -> WETH -> Fren Pet through the Uniswap v2 pairs `0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C`
   (USDC/WETH) and `0xDE66c35e01ED8e619Bf092352338ef94f2327337` (WETH/Fren Pet), and has the second pair send the
   tokens straight to `0x000000000000000000000000000000000000dEaD`.
-- **Price check.** Each burn compares the pools' output with their time-weighted average price since the previous
-  burn (at least 30 minutes earlier) and reverts if the output is more than 3% below it. This stops an atomic sandwich.
-  `poke()` starts a fresh window only when the last one is older than 6 hours.
+- **Price check.** Before it trades, each burn compares the route's marginal price (the pools' reserves, without fees
+  or impact) with its time-weighted average since the previous burn (at least 30 minutes earlier), and reverts if IMD is
+  more than 3% dearer. This stops an atomic sandwich. Fees and the trade's own impact are bounded by the size cap.
+  `poke()` starts a fresh window only when the last one is older than 6 hours and no burn could run now, so it cannot
+  delay a valid burn.
 - **`burnHeld()`** sends any Fren Pet that was sent to the contract directly to `0x…dEaD`.
-- Fren Pet charges a 4% buy fee and enforces size limits, but exempts transfers to `0x…dEaD` from both. Its owner can
-  still blacklist addresses.
+- Fren Pet charges a 4% buy fee and enforces size limits, but exempts transfers to `0x…dEaD` from both.
+
+## Trust assumptions
+
+- **Fren Pet's owner** (`0x54C4DD8C2E124c65f55E1E096aB1fb6543e1206c`) has not renounced its blacklist. Blacklisting
+  `0x…dEaD`, the WETH/Fren Pet pair or this contract stops every burn, and the USDC then stays in this contract for good
+  (there is no owner and no rescue path). The owner can also remove `0x…dEaD`'s fee exemption: burns still run, but up
+  to Fren Pet's buy fee (4% today, 5% at most) of each purchase goes to the Fren Pet contract. The `Burned` event reports
+  both the amount bought and the amount burned.
+- **Circle** can blacklist this contract on USDC, with the same effect as a blacklist above.
+- An attacker can move the route price by up to 3% before a burn without making it revert, so each burn can lose at
+  most about 3% to manipulation. Moving these pools by 3% costs far more in fees than 3% of a burn of at most $1,000.
 
 ## Test
 
@@ -24,6 +36,11 @@ The tests run against a fork of Base mainnet:
 ```
 BASE_RPC=https://base-rpc.publicnode.com forge test -vv
 ```
+
+## Audits
+
+- IMD swarm audit, job `de9e10c6-3380-4fb8-8808-91858e518099`, commit `4e49d40`: 1 medium, 3 low, 2 info. All are fixed or
+  documented in the next commit. The medium's proof is `test/ThinPoolLock.t.sol`.
 
 ## Audit scope
 

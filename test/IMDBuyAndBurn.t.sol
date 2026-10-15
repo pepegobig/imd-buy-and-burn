@@ -50,19 +50,17 @@ contract IMDBuyAndBurnTest is Test {
         _fund(10e6);
         _wait(31 minutes);
         uint256 deadBefore = IERC20(FP).balanceOf(DEAD);
-        (uint256 usdcIn, uint256 expected, uint256 spot,) = burner.preview();
+        (uint256 usdcIn, uint256 twapOut, uint256 spotOut, uint256 poolOut,) = burner.preview();
         assertEq(usdcIn, 10e6);
+        assertApproxEqRel(spotOut, twapOut, 1e15, "no trades: spot equals the TWAP");
         uint256 burned = burner.buyAndBurn();
         assertEq(IERC20(USDC).balanceOf(address(burner)), 0, "all USDC spent");
         assertEq(IERC20(FP).balanceOf(DEAD) - deadBefore, burned, "burn reached 0xdead");
-        assertGt(burned, 0);
-        assertLe(burned, spot, "never more than the pool output");
-        assertGe(burned, (spot * 95) / 100, "at most the 4% FP buy fee is lost");
-        assertGe(spot, (expected * 97) / 100, "spot within 3% of TWAP");
+        assertEq(burned, poolOut, "0xdead is exempt from the FP buy fee today");
+        assertGe(poolOut, (spotOut * 99) / 100, "fees and impact under 1% at $10");
         assertEq(burner.totalUsdcSpent(), 10e6);
         assertEq(burner.totalImdBurned(), burned);
         emit log_named_decimal_uint("IMD (FP) burned for $10", burned, 18);
-        emit log_named_decimal_uint("pool output before the FP buy fee", spot, 18);
     }
 
     function test_SecondBurnNeedsANewWindow() public {
@@ -88,20 +86,8 @@ contract IMDBuyAndBurnTest is Test {
         _fund(10e6);
         _wait(31 minutes);
         // An attacker pushes the IMD price up in the same block as the burn (the first leg of a sandwich)
-        IUniswapV2Pair pair = burner.WETH_IMD();
-        (uint112 r0, uint112 r1,) = pair.getReserves();
-        bool wethIs0 = pair.token0() == WETH;
-        (uint256 rW, uint256 rI) = wethIs0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
-        uint256 wethIn = rW / 8; // about 12% of the WETH side
-        address attacker = makeAddr("attacker");
-        deal(WETH, attacker, wethIn);
-        uint256 out = _amountOut(wethIn, rW, rI);
-        vm.startPrank(attacker);
-        IERC20(WETH).transfer(address(pair), wethIn);
-        if (wethIs0) pair.swap(0, out, DEAD, "");
-        else pair.swap(out, 0, DEAD, "");
-        vm.stopPrank();
-        vm.expectRevert(); // PriceOffTwap(expected, actual)
+        _pumpImd(8); // about 12% of the WETH side
+        vm.expectRevert(); // PriceOffTwap(twapOut, spotOut)
         burner.buyAndBurn();
     }
 
@@ -109,8 +95,76 @@ contract IMDBuyAndBurnTest is Test {
         vm.expectRevert(abi.encodeWithSelector(IMDBuyAndBurn.NotStale.selector, uint32(0)));
         burner.poke();
         _wait(6 hours + 1);
-        burner.poke();
+        burner.poke(); // no USDC: nothing to burn, so a fresh window may start
         assertEq(burner.obsTime(), uint32(block.timestamp));
+    }
+
+    /// Audit finding 4: poke() must not delay a burn that would succeed
+    function test_PokeCannotDelayAValidBurn() public {
+        _fund(10e6);
+        _wait(6 hours + 1);
+        vm.expectRevert(IMDBuyAndBurn.BurnAvailable.selector);
+        burner.poke();
+        assertGt(burner.buyAndBurn(), 0);
+    }
+
+    /// After a real price move, a burn waits; poke() then starts a window at the new price
+    function test_PokeRestartsTheWindowAfterAPriceMove() public {
+        _fund(10e6);
+        _wait(6 hours + 1);
+        _pumpImd(8); // IMD about 25% dearer, and it stays there
+        vm.expectRevert();
+        burner.buyAndBurn(); // PriceOffTwap
+        burner.poke();
+        _wait(31 minutes);
+        assertGt(burner.buyAndBurn(), 0);
+    }
+
+    /// Audit finding 6: a remainder below THRESHOLD is spent in the same burn
+    function test_DustRemainderIsSpent() public {
+        _fund(1_004e6);
+        _wait(31 minutes);
+        burner.buyAndBurn();
+        assertEq(IERC20(USDC).balanceOf(address(burner)), 0);
+    }
+
+    /// Audit finding 3: if FP's owner removes 0xdead's fee exemption, burns still run and the event shows the loss
+    function test_FeeExemptionRemovedStillBurns() public {
+        _fund(100e6);
+        _wait(31 minutes);
+        (bool ok,) = FP.call(abi.encodeWithSignature("owner()"));
+        assertTrue(ok);
+        address fpOwner = abi.decode(_call(FP, abi.encodeWithSignature("owner()")), (address));
+        vm.prank(fpOwner);
+        (ok,) = FP.call(abi.encodeWithSignature("excludeFromFees(address,bool)", DEAD, false));
+        assertTrue(ok, "excludeFromFees");
+        (,,, uint256 poolOut,) = burner.preview();
+        uint256 burned = burner.buyAndBurn();
+        assertLt(burned, poolOut, "the FP buy fee is taken");
+        assertGe(burned, (poolOut * 95) / 100, "at most 5% (FP's fee cap)");
+    }
+
+    function _call(address to, bytes memory data) internal view returns (bytes memory out) {
+        bool ok;
+        (ok, out) = to.staticcall(data);
+        require(ok, "call");
+    }
+
+    /// Buys IMD with 1/divisor of the WETH/IMD pair's WETH reserve and sends it to 0xdead
+    function _pumpImd(uint256 divisor) internal {
+        IUniswapV2Pair pair = burner.WETH_IMD();
+        (uint112 r0, uint112 r1,) = pair.getReserves();
+        bool wethIs0 = pair.token0() == WETH;
+        (uint256 rW, uint256 rI) = wethIs0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+        uint256 wethIn = rW / divisor;
+        address trader = makeAddr("trader");
+        deal(WETH, trader, wethIn);
+        uint256 out = _amountOut(wethIn, rW, rI);
+        vm.startPrank(trader);
+        IERC20(WETH).transfer(address(pair), wethIn);
+        if (wethIs0) pair.swap(0, out, DEAD, "");
+        else pair.swap(out, 0, DEAD, "");
+        vm.stopPrank();
     }
 
     function test_BurnsAfterLongIdle() public {
