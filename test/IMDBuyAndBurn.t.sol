@@ -75,11 +75,14 @@ contract IMDBuyAndBurnTest is Test {
         assertEq(burner.totalUsdcSpent(), 20e6);
     }
 
-    function test_CapsOneBurnAt1000() public {
+    function test_CapsOneBurn() public {
         _fund(1_500e6);
         _wait(31 minutes);
+        (uint256 usdcIn,,,,) = burner.preview();
+        assertLe(usdcIn, 1_000e6, "never more than MAX_PER_BURN");
         burner.buyAndBurn();
-        assertEq(IERC20(USDC).balanceOf(address(burner)), 500e6, "the rest waits for the next burn");
+        assertEq(IERC20(USDC).balanceOf(address(burner)), 1_500e6 - usdcIn, "the rest waits for the next burn");
+        assertGe(IERC20(USDC).balanceOf(address(burner)), 500e6);
     }
 
     function test_AtomicPumpReverts() public {
@@ -94,18 +97,22 @@ contract IMDBuyAndBurnTest is Test {
     function test_PokeOnlyWhenStale() public {
         vm.expectRevert(abi.encodeWithSelector(IMDBuyAndBurn.NotStale.selector, uint32(0)));
         burner.poke();
+        uint32 obs = burner.obsTime();
         _wait(6 hours + 1);
-        burner.poke(); // no USDC: nothing to burn, so a fresh window may start
-        assertEq(burner.obsTime(), uint32(block.timestamp));
+        burner.poke();
+        assertEq(burner.pendTime(), uint32(block.timestamp), "pending window opened");
+        assertEq(burner.obsTime(), obs, "the burn window is unchanged");
+        vm.expectRevert(abi.encodeWithSelector(IMDBuyAndBurn.PendingWindow.selector, uint32(0)));
+        burner.poke();
     }
 
-    /// Audit finding 4: poke() must not delay a burn that would succeed
+    /// Audit de9e10c6 finding 4 and dca64686 finding 1: poke() must not delay a burn that would succeed
     function test_PokeCannotDelayAValidBurn() public {
         _fund(10e6);
         _wait(6 hours + 1);
-        vm.expectRevert(IMDBuyAndBurn.BurnAvailable.selector);
         burner.poke();
         assertGt(burner.buyAndBurn(), 0);
+        assertEq(burner.pendTime(), 0, "a burn closes the pending window");
     }
 
     /// After a real price move, a burn waits; poke() then starts a window at the new price
@@ -120,12 +127,25 @@ contract IMDBuyAndBurnTest is Test {
         assertGt(burner.buyAndBurn(), 0);
     }
 
-    /// Audit finding 6: a remainder below THRESHOLD is spent in the same burn
-    function test_DustRemainderIsSpent() public {
-        _fund(1_004e6);
+    /// Audit de9e10c6 finding 6 and dca64686 finding 2: a capped burn leaves a burnable remainder, never dust
+    function test_CappedBurnLeavesABurnableRemainder() public {
+        _wait(31 minutes);
+        (uint256 cap,,,,) = _previewFor(10_000e6);
+        _fund(cap + 4e6);
+        burner.buyAndBurn();
+        assertEq(IERC20(USDC).balanceOf(address(burner)), 5e6, "exactly THRESHOLD is left");
         _wait(31 minutes);
         burner.buyAndBurn();
         assertEq(IERC20(USDC).balanceOf(address(burner)), 0);
+    }
+
+    /// preview() for a balance, without keeping that balance
+    function _previewFor(uint256 amount) internal returns (uint256, uint256, uint256, uint256, uint32) {
+        uint256 snap = vm.snapshotState();
+        _fund(amount);
+        (uint256 a, uint256 b, uint256 c, uint256 d, uint32 e) = burner.preview();
+        vm.revertToState(snap);
+        return (a, b, c, d, e);
     }
 
     /// Audit finding 3: if FP's owner removes 0xdead's fee exemption, burns still run and the event shows the loss
